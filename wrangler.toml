@@ -1,4 +1,4 @@
-name = "author-os"
+name = "publish"
 main = "workers.js"
 compatibility_date = "2024-02-15"
 
