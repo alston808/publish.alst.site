@@ -1,0 +1,6 @@
+name = "author-os"
+main = "workers.js"
+compatibility_date = "2024-02-15"
+
+[observability]
+enabled = true
