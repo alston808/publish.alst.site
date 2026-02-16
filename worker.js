@@ -1,6 +1,6 @@
 /**
- * CLOUDFLARE WORKER: THE "BOOK LAUNCH DASHBOARD"
- * Node 14 Compatible (Service Worker Syntax)
+ * CLOUDFLARE WORKER: AUTHOR COMMAND CENTER v2
+ * Features: Live Research (Serper), Parallel AI, BSR Analysis
  */
 
 // CONFIGURATION
@@ -11,32 +11,41 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// 1. LEGACY LISTENER (Node 14 / Wrangler v1/v2 compatible)
+// 1. LEGACY LISTENER (Node 14 Compatible)
 addEventListener("fetch", event => {
   event.respondWith(handleRequest(event.request));
 });
 
-// 2. MAIN ROUTER
+// 2. MAIN REQUEST HANDLER
 async function handleRequest(request) {
   if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
+  if (request.method === "GET") return new Response(HTML_UI, { headers: { "Content-Type": "text/html", ...CORS_HEADERS } });
 
-  const url = new URL(request.url);
-
-  // Serve the UI
-  if (request.method === "GET") {
-    return new Response(HTML_UI, { headers: { "Content-Type": "text/html", ...CORS_HEADERS } });
-  }
-
-  // Handle API Calls
   if (request.method === "POST") {
     try {
-      const { text, action } = await request.json();
-      
-      // Route to specific AI tasks
-      if (action === "analyze_all") return await generateDashboard(text);
-      if (action === "generate_cover") return await generateCoverPrompt(text);
+      const { action, text } = await request.json();
 
-      return new Response("Invalid Action", { status: 400 });
+      // Individual Tools
+      if (action === "cover") {
+        const prompt = await generateCoverPrompt(text);
+        return new Response(JSON.stringify({ prompt }), { headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
+      }
+
+      // MAIN: Run All Tools Concurrently
+      if (action === "analyze") {
+        // Run standard AI tasks + Live Research in parallel
+        const [seo, titles, blurb, polish, research] = await Promise.all([
+          simpleAI("seo", text),
+          simpleAI("titles", text),
+          advancedLoop("blurb", text),
+          advancedLoop("polish", text),
+          runMarketResearch(text) // NEW: Live Internet Search
+        ]);
+
+        return new Response(JSON.stringify({ seo, titles, blurb, polish, research }), { 
+          headers: { "Content-Type": "application/json", ...CORS_HEADERS } 
+        });
+      }
 
     } catch (err) {
       return new Response(JSON.stringify({ error: err.message }), { 
@@ -44,323 +53,256 @@ async function handleRequest(request) {
       });
     }
   }
-
   return new Response("Method not allowed", { status: 405 });
 }
 
-// 3. AI ORCHESTRATION (The "Deep Refine" Loops)
-async function generateDashboard(text) {
-  // We run these in parallel to speed up the dashboard generation
-  const [seoData, titlesData, blurbData, polishData] = await Promise.all([
-    runAI("seo", text),
-    runAI("titles", text),
-    runDeepRefineLoop("blurb", text), // Runs the 3-step critique loop
-    runDeepRefineLoop("polish", text) // Runs the 3-step critique loop
-  ]);
+// ---------------------------------------------------------
+// 3. NEW: MARKET RESEARCH AGENT (Live Search)
+// ---------------------------------------------------------
+async function runMarketResearch(text) {
+  // 1. Ask AI to generate a search query based on the book snippet
+  const queryPrompt = `Based on this text, write a single Google search query to find competitor best sellers on Amazon. 
+  Example output: "Amazon best sellers cyber thriller books"
+  Input: ${text.substring(0, 500)}`;
+  const searchQuery = await callOpenRouter("You are a Search Engineer.", queryPrompt);
 
-  return new Response(JSON.stringify({
-    seo: seoData,
-    titles: titlesData,
-    blurb: blurbData,
-    polish: polishData
-  }), { headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
-}
+  // 2. Perform Live Google Search (via Serper)
+  let searchResults = "";
+  try {
+    searchResults = await fetchGoogleResults(searchQuery);
+  } catch (e) {
+    searchResults = "Search unavailable (Key missing). Using internal AI knowledge.";
+  }
 
-// Helper: Standard Single-Shot AI Call
-async function runAI(mode, input) {
-  const systemPrompt = PROMPTS[mode];
-  const response = await callOpenRouter(systemPrompt, input);
-  return response;
-}
+  // 3. Analyze Results for BSR and Trends
+  const analysisPrompt = `
+    ACT AS: A Senior Market Analyst for Amazon KDP.
+    CONTEXT: Here are live Google search results for the user's genre:
+    ${searchResults}
 
-// Helper: The "Critique & Rewrite" Loop (Draft -> Critique -> Final)
-async function runDeepRefineLoop(mode, input) {
-  // Step 1: Draft
-  const draftPrompt = PROMPTS[mode + "_draft"];
-  const draft = await callOpenRouter(draftPrompt, input);
-
-  // Step 2: Critique & Rewrite (Combined for speed)
-  const critiquePrompt = `
-    You are a Harsh Editor. 
-    1. CRITIQUE the following text. Find 3 weak points (boring verbs, passive voice, lack of stakes).
-    2. REWRITE it into a "Version 2" that fixes these issues.
+    TASK: Analyze these results and the user's text to provide:
+    1. **Competition Level**: (Low/Medium/High) based on the titles found.
+    2. **BSR Target**: Estimate the Amazon Best Seller Rank needed to break Top 100 (e.g., "You need BSR < 5,000").
+    3. **Reader Expectations**: What tropes/keywords are visible in the top results?
+    4. **Gap Analysis**: What is missing in the current top books that the user's book provides?
     
-    TEXT TO CRITIQUE:
-    ${draft}
+    OUTPUT FORMAT: Bullet points. Be specific.
   `;
-  const v2 = await callOpenRouter("You are an editor.", critiquePrompt);
-
-  // Step 3: Final Polish (Best of All)
-  const finalPrompt = `
-    You have two versions of a text.
-    Version 1: ${draft}
-    Version 2 (Critiqued): ${v2}
-
-    TASK: Create the "Final Masterpiece". 
-    - Combine the strongest hooks from V1.
-    - Use the polished flow of V2.
-    - Ensure it is perfect for the current market.
-    - Output ONLY the final text. No preamble.
-  `;
-  const final = await callOpenRouter("You are a Best-Selling Publisher.", finalPrompt);
   
-  return final;
+  return await callOpenRouter("You are a Market Analyst.", analysisPrompt);
+}
+
+// Helper: Fetch from Serper.dev (Google Search API)
+async function fetchGoogleResults(query) {
+  // Check if key exists (Dashboard variable)
+  if (typeof SERPER_API_KEY === 'undefined' || !SERPER_API_KEY) {
+    return "Error: No SERPER_API_KEY found. Please add it to Cloudflare Variables.";
+  }
+
+  const response = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: {
+      "X-API-KEY": SERPER_API_KEY,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ q: query, num: 5 }) // Get top 5 results
+  });
+
+  const data = await response.json();
+  // Extract useful snippets
+  return data.organic.map(r => `- Title: ${r.title}\n  Snippet: ${r.snippet}`).join("\n\n");
+}
+
+// ---------------------------------------------------------
+// 4. EXISTING AI LOGIC
+// ---------------------------------------------------------
+async function simpleAI(mode, input) {
+  return await callOpenRouter(PROMPTS[mode], input);
+}
+
+async function advancedLoop(mode, input) {
+  const draft = await callOpenRouter(PROMPTS[mode + "_draft"], input);
+  const critiquePrompt = `CRITIQUE this text. Find 3 weak points. TEXT: "${draft}"`;
+  const critique = await callOpenRouter("You are a critic.", critiquePrompt);
+  const finalPrompt = `REWRITE this based on critique: ${critique}. ORIGINAL: ${draft}`;
+  return await callOpenRouter("You are an expert writer.", finalPrompt);
 }
 
 async function generateCoverPrompt(input) {
-  const prompt = `Analyze this book text and write a Stable Diffusion prompt for the cover. 
-  Include: Subject, Art Style, Lighting, Mood. 
-  Output ONLY the prompt. No chat.
-  Input: ${input.substring(0, 1000)}`; // Limit input for speed
-  
-  const coverPrompt = await callOpenRouter("You are an AI Art Director.", prompt);
-  return new Response(JSON.stringify({ prompt: coverPrompt }), { 
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS } 
-  });
+  const prompt = `Create a stable diffusion prompt for this book cover. Genre, Subject, Art Style.`;
+  return await callOpenRouter("You are an AI Art Director.", input.substring(0, 1000));
 }
 
-// 4. OPENROUTER API CALLER
 async function callOpenRouter(system, user) {
-  // We need to retrieve the key from the environment (Legacy way for Node 14 listener)
-  // In legacy listener, global variables are available if set in Dashboard
-  const apiKey = typeof OPENROUTER_API_KEY !== 'undefined' ? OPENROUTER_API_KEY : "MISSING_KEY";
-
-  const req = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const apiKey = OPENROUTER_API_KEY; // Must be set in Dashboard
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${apiKey}`,
       "Content-Type": "application/json",
       "HTTP-Referer": "https://cloudflare-worker.com",
-      "X-Title": "Author Dashboard"
+      "X-Title": "BookDashboard"
     },
     body: JSON.stringify({
       model: MODEL_ID,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user }
-      ]
+      messages: [{ role: "system", content: system }, { role: "user", content: user.substring(0, 15000) }]
     })
   });
-  
-  const data = await req.json();
+  const data = await response.json();
   return data.choices?.[0]?.message?.content || "AI Error";
 }
 
-// 5. PROMPT LIBRARY
 const PROMPTS = {
-  seo: `
-    Analyze the text. Output JSON ONLY with this format:
-    {
-      "keywords": ["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7"],
-      "categories": ["BISAC1", "BISAC2", "BISAC3"]
-    }
-    Focus on high-traffic, low-competition keywords (KD Spy method).
-  `,
-  titles: `
-    Generate 5 viral title options based on the text.
-    Format: "Title: Subtitle"
-    Output as a simple bulleted list.
-  `,
-  // Blurb Loop Prompts
-  blurb_draft: `
-    Write a "Freedom Shortcut" style book blurb.
-    Structure: Hook -> Struggle -> Solution -> CTA.
-    Make it emotional and punchy.
-  `,
-  // Polish Loop Prompts
-  polish_draft: `
-    Rewrite the first 300 words of the input to improve "Author Voice".
-    Focus on "Show, Don't Tell". Remove filter words.
-  `
+  seo: `Analyze text. Output 15 Amazon KDP Keywords (Short & Long tail), comma-separated.`,
+  titles: `Generate 5 Viral Titles & Subtitles. Hook-driven. Bullet points.`,
+  blurb_draft: `Write a Book Blurb: Hook -> Conflict -> Stakes. Urgent tone.`,
+  polish_draft: `Rewrite first 500 words. Show Don't Tell. Strong verbs.`
 };
 
-// 6. THE DASHBOARD UI (HTML/CSS/JS)
+// ---------------------------------------------------------
+// 5. UPDATED UI (HTML)
+// ---------------------------------------------------------
 const HTML_UI = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Book Launch Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <title>Author Command Center</title>
     <style>
-        :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --accent: #8b5cf6; --success: #10b981; }
-        body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
+        :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --accent: #3b82f6; --green: #10b981; --purple: #8b5cf6; }
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 15px; margin: 0; }
+        h1 { text-align: center; margin-bottom: 20px; }
         
-        /* Layout */
-        .container { max-width: 1000px; margin: 0 auto; display: grid; gap: 20px; }
+        .input-box { background: var(--card); padding: 15px; border-radius: 12px; border: 1px solid #334155; margin-bottom: 20px; }
+        textarea { width: 100%; height: 120px; background: #020617; color: white; border: 1px solid #334155; border-radius: 8px; padding: 10px; resize: none; }
         
-        /* Input Section */
-        .input-card { background: var(--card); padding: 20px; border-radius: 12px; border: 1px solid #334155; }
-        textarea { width: 100%; height: 150px; background: #020617; border: 1px solid #334155; color: white; padding: 10px; border-radius: 8px; resize: vertical; margin-bottom: 10px; font-family: monospace; }
-        
-        /* Buttons */
-        .btn { background: var(--accent); color: white; border: none; padding: 12px 24px; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 1rem; width: 100%; transition: transform 0.1s; }
-        .btn:active { transform: scale(0.98); }
-        .btn:disabled { opacity: 0.5; cursor: wait; }
-        .btn-outline { background: transparent; border: 1px solid var(--accent); color: var(--accent); margin-top: 10px; }
+        #launchBtn { width: 100%; background: linear-gradient(135deg, var(--accent), #2563eb); color: white; border: none; padding: 15px; border-radius: 8px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+        #launchBtn:disabled { opacity: 0.6; cursor: wait; }
 
-        /* Dashboard Grid */
-        .dashboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-top: 20px; display: none; }
-        .result-card { background: var(--card); padding: 20px; border-radius: 12px; border: 1px solid #334155; position: relative; }
-        .card-header { font-weight: bold; color: var(--accent); margin-bottom: 15px; border-bottom: 1px solid #334155; padding-bottom: 10px; display: flex; justify-content: space-between; }
+        .grid { display: grid; grid-template-columns: 1fr; gap: 15px; display: none; }
+        @media(min-width: 768px) { .grid { grid-template-columns: 1fr 1fr; } }
         
-        /* Tags styling */
-        .tag-cloud { display: flex; flex-wrap: wrap; gap: 8px; }
-        .tag { background: #334155; padding: 5px 10px; border-radius: 4px; font-size: 0.9rem; cursor: pointer; transition: background 0.2s; }
-        .tag:hover { background: var(--accent); }
+        .card { background: var(--card); border: 1px solid #334155; border-radius: 12px; padding: 15px; display: flex; flex-direction: column; }
+        .card h3 { margin: 0 0 10px 0; font-size: 1rem; color: var(--accent); display: flex; justify-content: space-between; }
         
-        /* Copy Utilities */
-        .copy-btn { background: #334155; border: none; color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; cursor: pointer; }
-        .copy-btn:active { background: var(--success); }
+        .research-card { border-color: var(--purple); background: #2e1065; }
+        .research-card h3 { color: #c4b5fd; }
 
-        /* Cover Art Section */
-        #cover-section { text-align: center; display: none; margin-top: 20px; }
-        .cover-img { max-width: 100%; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); margin-top: 15px; }
+        .copy-icon { background: #334155; padding: 4px 8px; border-radius: 4px; cursor: pointer; color: white; border: none; font-size: 0.8rem; }
+        .content { font-size: 0.95rem; line-height: 1.6; white-space: pre-wrap; color: #cbd5e1; }
+        
+        .tags { display: flex; flex-wrap: wrap; gap: 8px; }
+        .tag { background: #0f172a; border: 1px solid #334155; padding: 5px 10px; border-radius: 20px; font-size: 0.85rem; cursor: pointer; }
 
-        .spinner { display: inline-block; width: 20px; height: 20px; border: 3px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: #fff; animation: spin 1s infinite; }
+        .loader { text-align: center; margin: 20px 0; display: none; }
+        .spinner { display: inline-block; width: 25px; height: 25px; border: 3px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: var(--accent); animation: spin 0.8s infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
 
-<div class="container">
-    <header style="text-align: center; margin-bottom: 20px;">
-        <h1>🚀 Book Launch Dashboard</h1>
-        <p style="color: #94a3b8;">Paste your chapter once. Get everything.</p>
-    </header>
+    <h1>Author Command Center</h1>
 
-    <div class="input-card">
-        <textarea id="bookInput" placeholder="Paste your chapter, notes, or rough draft here..."></textarea>
-        <button id="generateBtn" class="btn" onclick="runAnalysis()">Generate Dashboard</button>
+    <div class="input-box">
+        <textarea id="textInput" placeholder="Paste your chapter, notes, or concept here..."></textarea>
+        <button id="launchBtn" onclick="runDashboard()">🚀 Run Launch Engine (+ Live Research)</button>
     </div>
 
-    <div id="dashboard" class="dashboard">
-        
-        <div class="result-card">
-            <div class="card-header">
-                🔍 SEO Keywords 
-                <button class="copy-btn" onclick="copyAllTags()">Copy All</button>
-            </div>
-            <div id="seo-results" class="tag-cloud">Loading...</div>
-        </div>
-
-        <div class="result-card">
-            <div class="card-header">🏷️ Viral Titles</div>
-            <div id="title-results" style="white-space: pre-line;">Loading...</div>
-        </div>
-
-        <div class="result-card" style="grid-column: 1 / -1;">
-            <div class="card-header">
-                📢 Masterpiece Blurb (3x Refined)
-                <button class="copy-btn" onclick="copyText('blurb-text')">Copy</button>
-            </div>
-            <div id="blurb-text" style="white-space: pre-line; color: #cbd5e1; line-height: 1.6;">Generating...</div>
-        </div>
-
-        <div class="result-card" style="grid-column: 1 / -1;">
-            <div class="card-header">
-                ✨ Polished Text (Critiqued & Rewritten)
-                <button class="copy-btn" onclick="copyText('polish-text')">Copy</button>
-            </div>
-            <div id="polish-text" style="white-space: pre-line; color: #cbd5e1; line-height: 1.6;">Polishing...</div>
-        </div>
-
-        <div class="result-card" style="grid-column: 1 / -1; text-align: center;">
-            <div class="card-header" style="justify-content: center;">🎨 Cover Art</div>
-            <p style="font-size: 0.9rem; color: #94a3b8;">Save credits/time. Only generate if needed.</p>
-            <button class="btn btn-outline" onclick="generateCover()">Generate Free Cover Art</button>
-            <div id="cover-section"></div>
-        </div>
-
+    <div id="loader" class="loader">
+        <div class="spinner"></div>
+        <p>Scanning Amazon BSR, Drafting, Critiquing...</p>
     </div>
-</div>
 
-<script>
-    async function runAnalysis() {
-        const text = document.getElementById('bookInput').value;
-        if (!text) return alert("Please enter some text!");
+    <div id="dashboard" class="grid">
+        <div class="card research-card" style="grid-column: 1 / -1;">
+            <h3>📊 Live Market Research & BSR <button class="copy-icon" onclick="copyText('researchOutput')">Copy</button></h3>
+            <div id="researchOutput" class="content"></div>
+        </div>
 
-        // Show UI
-        document.getElementById('dashboard').style.display = 'grid';
-        document.getElementById('generateBtn').disabled = true;
-        document.getElementById('generateBtn').innerHTML = '<div class="spinner"></div> Processing...';
+        <div class="card">
+            <h3>SEO Keywords <button class="copy-icon" onclick="copyAllTags()">Copy All</button></h3>
+            <div id="seoOutput" class="tags"></div>
+        </div>
 
-        try {
-            const res = await fetch('/', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'analyze_all', text: text })
-            });
-            const data = await res.json();
+        <div class="card">
+            <h3>Viral Titles <button class="copy-icon" onclick="copyText('titlesOutput')">Copy</button></h3>
+            <div id="titlesOutput" class="content"></div>
+        </div>
 
-            // Populate SEO
-            const seoDiv = document.getElementById('seo-results');
+        <div class="card" style="grid-column: 1 / -1;">
+            <h3>Master Blurb <button class="copy-icon" onclick="copyText('blurbOutput')">Copy</button></h3>
+            <div id="blurbOutput" class="content"></div>
+        </div>
+
+        <div class="card" style="grid-column: 1 / -1;">
+            <h3>Polished Excerpt <button class="copy-icon" onclick="copyText('polishOutput')">Copy</button></h3>
+            <div id="polishOutput" class="content"></div>
+        </div>
+
+        <div class="card" style="grid-column: 1 / -1; align-items: center;">
+            <h3>Cover Art</h3>
+            <button style="background:transparent; border:1px solid var(--accent); color:var(--accent); padding:8px 16px; border-radius:6px; cursor:pointer;" onclick="generateCover()">🎨 Generate Cover</button>
+            <div id="coverArea" style="margin-top:10px; text-align:center;"></div>
+        </div>
+    </div>
+
+    <script>
+        async function runDashboard() {
+            const text = document.getElementById('textInput').value;
+            if (!text) return alert("Please enter text.");
+
+            document.getElementById('dashboard').style.display = 'none';
+            document.getElementById('loader').style.display = 'block';
+            document.getElementById('launchBtn').disabled = true;
+
             try {
-                // Remove Markdown code blocks if AI added them
-                const cleanJson = data.seo.replace(/\\\`\\\`\\\`json/g, '').replace(/\\\`\\\`\\\`/g, '');
-                const seoObj = JSON.parse(cleanJson);
-                seoDiv.innerHTML = seoObj.keywords.map(k => \`<span class="tag" onclick="copyTag(this)">\${k}</span>\`).join('');
-            } catch(e) { seoDiv.innerText = data.seo; }
+                const res = await fetch('/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'analyze', text: text })
+                });
+                const data = await res.json();
+                
+                if (data.error) throw new Error(data.error);
 
-            // Populate Text Fields
-            document.getElementById('title-results').innerText = data.titles;
-            document.getElementById('blurb-text').innerText = data.blurb;
-            document.getElementById('polish-text').innerText = data.polish;
+                // Render Results
+                document.getElementById('researchOutput').innerText = data.research; // Research result
+                document.getElementById('titlesOutput').innerText = data.titles;
+                document.getElementById('blurbOutput').innerText = data.blurb;
+                document.getElementById('polishOutput').innerText = data.polish;
 
-        } catch (e) {
-            alert("Error: " + e.message);
+                const tags = data.seo.split(',').map(t => t.trim());
+                document.getElementById('seoOutput').innerHTML = tags.map(tag => \`<span class="tag" onclick="copyTag(this)">\${tag}</span>\`).join('');
+
+                document.getElementById('loader').style.display = 'none';
+                document.getElementById('dashboard').style.display = 'grid';
+
+            } catch (e) {
+                alert("Error: " + e.message);
+                document.getElementById('loader').style.display = 'none';
+            }
+            document.getElementById('launchBtn').disabled = false;
         }
 
-        document.getElementById('generateBtn').disabled = false;
-        document.getElementById('generateBtn').innerText = 'Generate Dashboard';
-    }
-
-    async function generateCover() {
-        const text = document.getElementById('bookInput').value;
-        const coverDiv = document.getElementById('cover-section');
-        coverDiv.style.display = 'block';
-        coverDiv.innerHTML = '<div class="spinner"></div> designing...';
-
-        try {
+        async function generateCover() {
+            const text = document.getElementById('textInput').value;
+            const area = document.getElementById('coverArea');
+            area.innerHTML = 'Designing...';
             const res = await fetch('/', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'generate_cover', text: text })
+                body: JSON.stringify({ action: 'cover', text: text })
             });
             const data = await res.json();
-            
-            // Use Pollinations for instant image
-            const encodedPrompt = encodeURIComponent(data.prompt);
-            const imgUrl = \`https://image.pollinations.ai/prompt/\${encodedPrompt}?width=768&height=1152&model=flux&nologo=true\`;
-            
-            coverDiv.innerHTML = \`<img src="\${imgUrl}" class="cover-img" alt="Cover"><br><a href="\${imgUrl}" target="_blank" style="color:white; display:block; margin-top:10px;">Download HD</a>\`;
-
-        } catch (e) {
-            coverDiv.innerText = "Error creating cover.";
+            const url = \`https://image.pollinations.ai/prompt/\${encodeURIComponent(data.prompt)}?width=768&height=1152&model=flux&nologo=true\`;
+            area.innerHTML = \`<img src="\${url}" style="max-width:100%; border-radius:8px; box-shadow:0 4px 12px rgba(0,0,0,0.5);"><br><a href="\${url}" target="_blank" style="color:#3b82f6; display:block; margin-top:10px;">Download</a>\`;
         }
-    }
 
-    // Copy Utilities
-    function copyTag(el) {
-        navigator.clipboard.writeText(el.innerText);
-        const original = el.style.background;
-        el.style.background = '#10b981';
-        setTimeout(() => el.style.background = '', 500);
-    }
-
-    function copyAllTags() {
-        const tags = Array.from(document.querySelectorAll('.tag')).map(t => t.innerText).join(', ');
-        navigator.clipboard.writeText(tags);
-        alert("All tags copied!");
-    }
-
-    function copyText(id) {
-        const text = document.getElementById(id).innerText;
-        navigator.clipboard.writeText(text);
-        alert("Text copied!");
-    }
-</script>
-
+        function copyTag(el) { navigator.clipboard.writeText(el.innerText); el.style.background = '#10b981'; }
+        function copyAllTags() { navigator.clipboard.writeText(Array.from(document.querySelectorAll('.tag')).map(t => t.innerText).join(', ')); }
+        function copyText(id) { navigator.clipboard.writeText(document.getElementById(id).innerText); }
+    </script>
 </body>
 </html>
 `;
